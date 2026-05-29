@@ -436,10 +436,75 @@ class SingleStoreExtractor(SchemaExtractor):
         return set()
 
     def analyze_table(self, table):
-        """Run ANALYZE TABLE to collect statistics."""
-        # SingleStore ANALYZE syntax
-        self.cursor.execute(f"ANALYZE TABLE `{self.database}`.`{table}`")
-        self.cursor.fetchall()
+        """Run ANALYZE TABLE to collect statistics and create histograms.
+
+        Creates histograms on numeric/date columns (excludes PK and string),
+        then removes histograms from high-cardinality equi-height columns where
+        comparison would be meaningless. Aligns with MySQL behavior.
+        """
+        # Step 1: Create histograms on numeric/date columns, exclude PK
+        self.cursor.execute("""
+            SELECT c.COLUMN_NAME
+            FROM information_schema.columns c
+            WHERE c.TABLE_SCHEMA = %s AND c.TABLE_NAME = %s
+              AND c.DATA_TYPE IN ('int', 'bigint', 'smallint', 'tinyint', 'mediumint',
+                                  'decimal', 'numeric', 'float', 'double',
+                                  'date', 'datetime', 'timestamp', 'time', 'year')
+              AND c.COLUMN_NAME NOT IN (
+                  SELECT k.COLUMN_NAME
+                  FROM information_schema.KEY_COLUMN_USAGE k
+                  WHERE k.TABLE_SCHEMA = %s AND k.TABLE_NAME = %s
+                    AND k.CONSTRAINT_NAME = 'PRIMARY'
+              )
+            ORDER BY c.ORDINAL_POSITION
+        """, (self.database, table, self.database, table))
+        numeric_cols = [row[0] for row in self.cursor.fetchall()]
+        pk_cols = self.get_primary_keys(table)
+        numeric_cols = [c for c in numeric_cols if c not in pk_cols]
+
+        if numeric_cols:
+            col_list = ", ".join(numeric_cols)
+            self.cursor.execute(
+                f"ANALYZE TABLE `{self.database}`.`{table}` COLUMNS {col_list} ENABLE"
+            )
+            self.cursor.fetchall()
+        else:
+            self.cursor.execute(f"ANALYZE TABLE `{self.database}`.`{table}`")
+            self.cursor.fetchall()
+            return
+
+        # Step 2: Remove histograms from high-cardinality equi-height + PK columns
+        try:
+            self.cursor.execute("""
+                SELECT COLUMN_NAME, MAX(UNIQUE_COUNT) as max_unique,
+                       COUNT(*) as num_buckets
+                FROM information_schema.ADVANCED_HISTOGRAMS
+                WHERE DATABASE_NAME = %s AND TABLE_NAME = %s
+                  AND BUCKET_INDEX >= 0 AND CARDINALITY > 0
+                GROUP BY COLUMN_NAME
+            """, (self.database, table))
+            cols_to_disable = []
+            for col, max_unique, num_buckets in self.cursor.fetchall():
+                if max_unique > 1 and num_buckets > 20:
+                    cols_to_disable.append(col)
+                elif col in pk_cols:
+                    cols_to_disable.append(col)
+            if cols_to_disable:
+                self.cursor.execute(
+                    f"ALTER TABLE `{self.database}`.`{table}` AUTOSTATS_HISTOGRAM_MODE=OFF"
+                )
+                self.cursor.fetchall()
+                for col in cols_to_disable:
+                    self.cursor.execute(
+                        f"ANALYZE TABLE `{self.database}`.`{table}` COLUMNS {col} DISABLE"
+                    )
+                    self.cursor.fetchall()
+                self.cursor.execute(
+                    f"ALTER TABLE `{self.database}`.`{table}` AUTOSTATS_HISTOGRAM_MODE=CREATE"
+                )
+                self.cursor.fetchall()
+        except Exception:
+            pass
 
     def get_column_histogram(self, table, column):
         """Get histogram from SingleStore's ADVANCED_HISTOGRAMS view."""
@@ -521,8 +586,12 @@ class SingleStoreExtractor(SchemaExtractor):
         if not buckets:
             return None
 
-        # Filter out invalid buckets (with None values)
-        valid_buckets = [b for b in buckets if b[1] is not None and b[2] is not None and b[3] is not None]
+        # Filter out invalid and zero-cardinality buckets
+        valid_buckets = [
+            b for b in buckets
+            if b[1] is not None and b[2] is not None and b[3] is not None
+            and b[3] > 0
+        ]
 
         if not valid_buckets:
             return None
@@ -533,22 +602,50 @@ class SingleStoreExtractor(SchemaExtractor):
         }
 
         cumulative_freq = 0.0
-        total_freq = sum(row[3] for row in valid_buckets)  # Sum all cardinalities
+        total_freq = sum(row[3] for row in valid_buckets)
 
         if total_freq == 0:
             return None
 
+        # Detect singleton-like histograms: all buckets have unique_count <= 1
+        all_singleton = all(
+            (int(b[4]) if b[4] else 1) <= 1 for b in valid_buckets
+        )
+
+        if all_singleton:
+            histogram["histogram-type"] = "singleton"
+            for bucket_index, range_min, range_max, cardinality, unique_count in valid_buckets:
+                cumulative_freq += (cardinality / total_freq)
+                histogram["buckets"].append([
+                    float(bucket_index + 1),
+                    round(cumulative_freq, 5),
+                ])
+            return histogram
+
+        # Equi-height path: check if ranges are numeric or binary-encoded
+        try:
+            float(valid_buckets[0][1])
+            numeric_ranges = True
+        except (ValueError, TypeError):
+            numeric_ranges = False
+
+        synthetic_start = 0
         for bucket_index, range_min, range_max, cardinality, unique_count in valid_buckets:
             cumulative_freq += (cardinality / total_freq)
+            num_distinct = int(unique_count) if unique_count else 1
 
-            # Convert to format: [lower, upper, cumulative_freq, num_distinct]
-            # bucket[3] must be num_distinct (not row count) because
-            # histogram_to_case() uses it to control how many synthetic values to generate
+            if numeric_ranges:
+                lo = float(range_min)
+                hi = float(range_max)
+            else:
+                lo = float(synthetic_start)
+                hi = float(synthetic_start + max(1, num_distinct) - 1)
+                synthetic_start = int(hi) + 1
+
             histogram["buckets"].append([
-                float(range_min),
-                float(range_max),
+                lo, hi,
                 round(cumulative_freq, 5),
-                int(unique_count) if unique_count else 1
+                num_distinct
             ])
 
         return histogram

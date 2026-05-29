@@ -1257,9 +1257,38 @@ def step_c_create_insert_validate(cursor, table):
     if DB_TYPE == 'mysql':
         cursor.execute(f"ANALYZE TABLE `{SOURCE_SCHEMA}`.`{table}`")
         cursor.fetchall()
-    analyze_suffix = " ALL COLUMNS" if DB_TYPE == 'tidb' else ""
-    cursor.execute(f"ANALYZE TABLE `{TARGET_SCHEMA}`.`{table}`{analyze_suffix}")
-    cursor.fetchall()
+        cursor.execute(f"ANALYZE TABLE `{TARGET_SCHEMA}`.`{table}`")
+        cursor.fetchall()
+    elif DB_TYPE == 'tidb':
+        cursor.execute(f"ANALYZE TABLE `{TARGET_SCHEMA}`.`{table}` ALL COLUMNS")
+        cursor.fetchall()
+    else:
+        # SingleStore: selective target histogram creation
+        try:
+            cursor.execute("""
+                SELECT COLUMN_NAME, MAX(UNIQUE_COUNT) as max_unique,
+                       COUNT(*) as num_buckets
+                FROM information_schema.ADVANCED_HISTOGRAMS
+                WHERE DATABASE_NAME = %s AND TABLE_NAME = %s
+                  AND BUCKET_INDEX >= 0 AND CARDINALITY > 0
+                GROUP BY COLUMN_NAME
+            """, (SOURCE_SCHEMA, table))
+            cols_to_enable = []
+            for col, max_unique, num_buckets in cursor.fetchall():
+                if max_unique <= 1 or num_buckets <= 20:
+                    cols_to_enable.append(col)
+            if cols_to_enable:
+                col_list = ", ".join(cols_to_enable)
+                cursor.execute(
+                    f"ANALYZE TABLE `{TARGET_SCHEMA}`.`{table}` COLUMNS {col_list} ENABLE"
+                )
+                cursor.fetchall()
+            else:
+                cursor.execute(f"ANALYZE TABLE `{TARGET_SCHEMA}`.`{table}`")
+                cursor.fetchall()
+        except Exception:
+            cursor.execute(f"ANALYZE TABLE `{TARGET_SCHEMA}`.`{table}`")
+            cursor.fetchall()
 
     # --- DDL validation ---
     cursor.execute(f"SHOW CREATE TABLE `{SOURCE_SCHEMA}`.`{table}`")
@@ -1267,7 +1296,15 @@ def step_c_create_insert_validate(cursor, table):
     cursor.execute(f"SHOW CREATE TABLE `{TARGET_SCHEMA}`.`{table}`")
     tgt_ddl = cursor.fetchone()[1]
 
-    if normalize_ddl(src_ddl, SOURCE_SCHEMA) != normalize_ddl(tgt_ddl, SOURCE_SCHEMA):
+    def _normalize_for_compare(ddl, schema):
+        normalized = normalize_ddl(ddl, schema)
+        if DB_TYPE != 'mysql':
+            normalized = re.sub(r'autostats_\w+=\S+', '', normalized)
+            normalized = re.sub(r"sql_mode='[^']*'", '', normalized)
+            normalized = re.sub(r'\s+', ' ', normalized).strip()
+        return normalized
+
+    if _normalize_for_compare(src_ddl, SOURCE_SCHEMA) != _normalize_for_compare(tgt_ddl, SOURCE_SCHEMA):
         ddl_ok = False
         report_ddl_mismatch(src_ddl, tgt_ddl)
     else:

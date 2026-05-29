@@ -325,8 +325,23 @@ def annotate_table_with_statistics(extractor, database, table, generated_appenda
         col_type = column_types.get(col)
         synthetic = ""
 
+        # All-NULL column: verify with COUNT(DISTINCT) before marking as null.
+        is_all_null = False
+        if col not in primary_key_columns and "DEFAULT NULL" in line:
+            opt_card = col_cardinality.get(col, -1)
+            if opt_card == 0 or opt_card == 1:
+                try:
+                    exact_ndv = extractor.get_distinct_count(table, col)
+                    if exact_ndv == 0:
+                        is_all_null = True
+                except Exception:
+                    pass
+
+        if is_all_null:
+            synthetic = "null"
+
         # MasterRun.py may precompute expressions for FK, PK, or composite keys.
-        if col in generated_appendages:
+        elif col in generated_appendages:
             synthetic = generated_appendages[col]
 
         elif col in composite_pk_appendages:
@@ -401,15 +416,52 @@ def annotate_table_with_statistics(extractor, database, table, generated_appenda
             synthetic = text_appendage()
 
         elif col_type in DATETIME_TYPES:
-            distinct_count = _column_distinct_count(
-                extractor,
-                table,
-                col,
-                col_cardinality,
-                exact_distinct_cache,
-                prefer_exact=True,
-            )
-            synthetic = _temporal_ndv_expression(col_type, distinct_count) or "rand.u31_timestamp()"
+            # Check for singleton histogram — use frequency-preserving bands
+            histogram = extractor.get_column_histogram(table, col)
+            if histogram and histogram.get("histogram-type") == "singleton":
+                buckets = histogram.get("buckets", [])
+                if buckets:
+                    try:
+                        extractor.cursor.execute(
+                            f"SELECT COUNT(*) FROM `{extractor.database}`.`{table}` "
+                            f"WHERE `{col}` IS NOT NULL")
+                        effective_rows = extractor.cursor.fetchone()[0] or table_row_count
+                    except Exception:
+                        effective_rows = table_row_count
+                    weights = []
+                    prev = 0.0
+                    for b in buckets:
+                        weights.append(max(0.0, round(b[1] - prev, 5)))
+                        prev = b[1]
+                    counts = [int(round(w * effective_rows)) for w in weights]
+                    diff = effective_rows - sum(counts)
+                    if counts:
+                        counts[-1] += diff
+                    cumulative = 0
+                    det_lines = []
+                    interval_unit = "DAY" if col_type == "date" else "SECOND"
+                    for i, count in enumerate(counts):
+                        if count <= 0:
+                            continue
+                        cumulative += count
+                        det_lines.append(
+                            f"when rownum <= {cumulative} then "
+                            f"TIMESTAMP '{SYNTHETIC_BASE_DATETIME}' + INTERVAL {i} {interval_unit}")
+                    if det_lines:
+                        if "DEFAULT NULL" in line and cumulative < table_row_count:
+                            else_expr = "null"
+                        else:
+                            else_expr = f"TIMESTAMP '{SYNTHETIC_BASE_DATETIME}' + INTERVAL {len(counts)-1} {interval_unit}"
+                        synthetic = f"""case
+    {' '.join(det_lines)}
+    else {else_expr}
+    end"""
+            if not synthetic:
+                distinct_count = _column_distinct_count(
+                    extractor, table, col, col_cardinality,
+                    exact_distinct_cache, prefer_exact=True,
+                )
+                synthetic = _temporal_ndv_expression(col_type, distinct_count) or "rand.u31_timestamp()"
 
         elif col_type in YEAR:
             distinct_count = _column_distinct_count(
@@ -434,12 +486,29 @@ def annotate_table_with_statistics(extractor, database, table, generated_appenda
                 prefer_exact=True,
             )
             if histogram:
+                # For singleton histograms with nullable columns, use non-NULL row count
+                effective_rows = table_row_count
+                if (histogram.get("histogram-type") == "singleton"
+                        and "DEFAULT NULL" in line):
+                    try:
+                        extractor.cursor.execute(
+                            f"SELECT COUNT(*) FROM `{extractor.database}`.`{table}` "
+                            f"WHERE `{col}` IS NOT NULL")
+                        nr = extractor.cursor.fetchone()[0]
+                        if nr and nr < table_row_count:
+                            effective_rows = nr
+                    except Exception:
+                        pass
                 synthetic = histogram_to_case(
                     histogram,
                     line,
                     actual_distinct,
-                    table_row_count,
+                    effective_rows,
                 )
+                # For nullable singleton: replace else with null
+                if (synthetic and effective_rows < table_row_count
+                        and "DEFAULT NULL" in line and "\n    else " in synthetic):
+                    synthetic = synthetic.rsplit("\n    else ", 1)[0] + "\n    else null\n    end"
                 if not synthetic:
                     synthetic = _numeric_ndv_expression(line, actual_distinct)
             else:

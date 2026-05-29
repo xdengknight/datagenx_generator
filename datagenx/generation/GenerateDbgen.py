@@ -1246,14 +1246,19 @@ def histogram_to_case(hist, ddl_line, actual_distinct_count=None, row_count=None
     )
     scale = 10 ** int(decimal_match.group(1)) if decimal_match else 1
 
-    # Detect small tables or high distinct ratio (>90%)
-    # These need deterministic generation to avoid birthday paradox collisions
-    # See VALIDATION_ISSUES.md Section 5: "Small Table Histogram Issues"
+    # Detect cases where simple deterministic mod() is better than histogram bucketing.
+    # Singleton histograms always go through their own path (preserves per-value frequency).
     use_deterministic = False
     if row_count and actual_distinct_count:
         distinct_ratio = actual_distinct_count / row_count if row_count > 0 else 0
-        # Small tables (<100 rows) OR high distinct ratio (>90%) need deterministic
-        use_deterministic = (row_count < 100) or (distinct_ratio > 0.9)
+        is_singleton = (hist_type == "singleton")
+        if not is_singleton:
+            num_hist_buckets = len(buckets)
+            use_deterministic = (
+                (row_count < 100)
+                or (distinct_ratio > 0.9)
+                or (actual_distinct_count < num_hist_buckets)
+            )
 
     # For small tables or 1:1 columns, use simple deterministic mod() cycling
     # This guarantees all distinct values are used exactly once (or evenly distributed)
@@ -1278,21 +1283,29 @@ def histogram_to_case(hist, ddl_line, actual_distinct_count=None, row_count=None
 
     if hist_type == "singleton":
         # For singleton: generate synthetic sequential values
-        # Use simple sequential integers (or scaled for decimals)
-        # If actual_distinct_count provided, use it instead of bucket count
-        num_values = actual_distinct_count if actual_distinct_count else len(buckets)
+        # Use max(actual_distinct, len(buckets)) to handle NULL bucket mismatches
+        if actual_distinct_count:
+            num_values = max(actual_distinct_count, len(buckets))
+        else:
+            num_values = len(buckets)
         for i in range(1, num_values + 1):
-            synthetic_val = i / scale if scale > 1 else float(i)
+            synthetic_val = f"{i}/{scale}" if scale > 1 else str(i)
             case_lines.append(f"when {i} then {synthetic_val}")
 
-        # Adjust weights array if needed
-        if actual_distinct_count and actual_distinct_count != len(buckets):
-            # Redistribute weights evenly for the actual count
-            weights = [1.0 / num_values] * num_values
+        # Align weights to num_values
+        if num_values < len(weights):
+            sorted_weights = sorted(weights, reverse=True)[:num_values]
+            w_total = sum(sorted_weights)
+            weights = [w / w_total for w in sorted_weights] if w_total > 0 else [1.0/num_values]*num_values
+        elif num_values > len(weights):
+            extra = num_values - len(weights)
+            min_weight = min(weights) if weights else 1.0/num_values
+            weights = weights + [min_weight] * extra
+            w_total = sum(weights)
+            weights = [w / w_total for w in weights] if w_total > 0 else [1.0/num_values]*num_values
 
         if row_count and num_values <= 1000:
-            # Deterministic weighted bands avoid random histogram drift for
-            # low-cardinality numeric columns such as TPC-H part.p_size.
+            # Deterministic weighted bands preserve per-value frequency
             counts = [int(round(w * row_count)) for w in weights]
             diff = row_count - sum(counts)
             if counts:
@@ -1304,11 +1317,11 @@ def histogram_to_case(hist, ddl_line, actual_distinct_count=None, row_count=None
                 if count <= 0:
                     continue
                 cumulative += count
-                synthetic_val = i / scale if scale > 1 else float(i)
+                synthetic_val = f"{i}/{scale}" if scale > 1 else str(i)
                 deterministic_lines.append(f"when rownum <= {cumulative} then {synthetic_val}")
 
             if deterministic_lines:
-                final_val = num_values / scale if scale > 1 else float(num_values)
+                final_val = f"{num_values}/{scale}" if scale > 1 else str(num_values)
                 return f"""case
     {' '.join(deterministic_lines)}
     else {final_val}
@@ -1318,71 +1331,75 @@ def histogram_to_case(hist, ddl_line, actual_distinct_count=None, row_count=None
     {' '.join(case_lines)}
     end"""
     else:
-        # For equi-height: use DETERMINISTIC bucket assignment to guarantee all distinct values
-        #
-        # Problem with rand.weighted: randomly assigns rows to buckets, causing collisions
-        # when we try to generate num_distinct values per bucket.
-        #
-        # Solution: Use mod(rownum, num_buckets) for bucket selection (equi-height = equal frequency)
-        # Then use div(rownum, num_buckets) as "local row number" to cycle through all values.
-        #
-        # This guarantees:
-        # 1. Equal distribution across buckets (matches equi-height histogram)
-        # 2. All distinct values are used (no random collisions)
+        # For equi-height: use WEIGHTED BAND assignment.
+        # Each bucket gets rows proportional to its cardinality weight.
+        # Within each band, mod() cycles through the bucket's distinct values.
 
         num_buckets = len(buckets)
 
-        # Get raw num_distinct from each bucket
         raw_distinct_counts = []
         for b in buckets:
             num_distinct = int(b[3]) if len(b) > 3 else 1
             raw_distinct_counts.append(max(1, num_distinct))
 
-        # If actual_distinct_count is provided, scale bucket counts proportionally
-        # This fixes histogram extrapolation errors when sampling_rate < 1.0
         histogram_total = sum(raw_distinct_counts)
         if actual_distinct_count and histogram_total > 0:
             scale_factor = actual_distinct_count / histogram_total
             distinct_counts = [max(1, int(round(c * scale_factor))) for c in raw_distinct_counts]
-            # Adjust to match exact total (rounding may cause slight mismatch)
             diff = actual_distinct_count - sum(distinct_counts)
             if diff != 0:
-                # Add/subtract from largest bucket
                 max_idx = distinct_counts.index(max(distinct_counts))
                 distinct_counts[max_idx] = max(1, distinct_counts[max_idx] + diff)
         else:
             distinct_counts = raw_distinct_counts
 
-        # Generate case expressions with deterministic cycling
-        # local_row = div(rownum-1, num_buckets) gives 0, 0, 0, ..., 1, 1, 1, ..., 2, 2, 2, ...
-        # mod(local_row, num_distinct) cycles through all distinct values
+        effective_row_count = row_count if row_count else sum(
+            max(1, int(b[3]) if len(b) > 3 and b[3] else 1) for b in buckets
+        ) * 10
+
+        raw_row_alloc = [int(round(w * effective_row_count)) for w in weights]
+        row_alloc = [max(dc, ra) for dc, ra in zip(distinct_counts, raw_row_alloc)]
+        alloc_total = sum(row_alloc)
+        if alloc_total > 0 and alloc_total != effective_row_count:
+            ratio = effective_row_count / alloc_total
+            row_alloc = [max(dc, int(round(ra * ratio))) for dc, ra in zip(distinct_counts, row_alloc)]
+
         synthetic_start = 0
-        for i, num_distinct in enumerate(distinct_counts, start=1):
+        cumulative_rows = 0
+        deterministic_lines = []
+
+        for i, (num_distinct, band_rows) in enumerate(zip(distinct_counts, row_alloc)):
             synthetic_lo = synthetic_start
+            cumulative_rows += band_rows
 
             if num_distinct == 1:
-                # Single value bucket - generate exactly 1 value
                 if scale == 1:
-                    case_lines.append(f"when {i} then {synthetic_lo}")
+                    deterministic_lines.append(f"when rownum <= {cumulative_rows} then {synthetic_lo}")
                 else:
-                    case_lines.append(f"when {i} then {synthetic_lo}/{scale}")
+                    deterministic_lines.append(f"when rownum <= {cumulative_rows} then {synthetic_lo}/{scale}")
                 synthetic_start = synthetic_lo + 1
             else:
-                # Multi-value bucket - use div/mod for deterministic cycling through all values
-                # div(rownum-1, num_buckets) = local row number (0, 1, 2, ... for each bucket)
-                # mod(local_row, num_distinct) = cycles through 0 to num_distinct-1
+                band_start = cumulative_rows - band_rows
                 if scale == 1:
-                    case_lines.append(f"when {i} then mod(div(rownum-1,{num_buckets}),{num_distinct})+{synthetic_lo}")
+                    deterministic_lines.append(
+                        f"when rownum <= {cumulative_rows} then mod(rownum-1-{band_start},{num_distinct})+{synthetic_lo}"
+                    )
                 else:
-                    case_lines.append(
-                        f"when {i} then (mod(div(rownum-1,{num_buckets}),{num_distinct})+{synthetic_lo})/{scale}"
+                    deterministic_lines.append(
+                        f"when rownum <= {cumulative_rows} then (mod(rownum-1-{band_start},{num_distinct})+{synthetic_lo})/{scale}"
                     )
                 synthetic_start = synthetic_lo + num_distinct
 
-        # Use deterministic bucket selection: mod(rownum-1, num_buckets)+1 gives buckets 1,2,3,...,N,1,2,3,...
-        return f"""case mod(rownum-1,{num_buckets})+1
-    {' '.join(case_lines)}
+        if deterministic_lines:
+            final_val = synthetic_start - 1
+            if scale != 1:
+                final_val = f"{final_val}/{scale}"
+            return f"""case
+    {' '.join(deterministic_lines)}
+    else {final_val}
     end"""
+
+        return f"mod(rownum-1, {actual_distinct_count or histogram_total}) + 1"
 
 
 def annotate_table_with_histogram(host, user, password, database, table, target_database=None, generated_appendages=None):
